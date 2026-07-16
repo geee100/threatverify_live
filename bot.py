@@ -1,103 +1,132 @@
-import os, requests, asyncio
+import os
+import time
+import threading
+import requests
+import gspread
+from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-BOT_TOKEN = "8542751247:AAH_N4BWxh7bEEYHLi2-8pcr8CNhCBgGyBE"
-YOUR_WALLET = "TDMGiXCJNqcjkXrp6jvoph9G5NSy73R3gb"
-PRICE = 5 # $5 USDT
-ADMIN_ID = 8542751247 # This is your Telegram ID from your token. Change if needed
+# === CONFIG ===
+TOKEN = os.getenv("BOT_TOKEN")
+SHEET_NAME = os.getenv("SHEET_NAME")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
-users_db = {} # {user_id: {"txid": "", "status": "pending"}}
-scam_db = {} # {username: {"reports": 2, "last_case": "$50"}}
+# USDT TRC20 Contract Address
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+TRONGRID_URL = "https://api.trongrid.io"
 
-TRON_API = "https://apilist.tronscan.org/api/transfer"
+# === GOOGLE SHEETS SETUP ===
+def connect_sheet():
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(eval(GOOGLE_CREDS_JSON), scopes=scope)
+    client = gspread.authorize(creds)
+    return client.open(SHEET_NAME).sheet1
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🔍 Report Scammer", callback_data='report')],
-        [InlineKeyboardButton("📊 My Reports", callback_data='reports')],
-        [InlineKeyboardButton("💬 Support", callback_data='support')]
-    ]
-    await update.message.reply_text(
-        "⚡ Threat Verify Pro Bot\nAI-Powered Scam Intelligence\nPick an option:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+sheet = connect_sheet()
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-
-    if query.data == 'report':
-        await query.message.reply_text(
-            f"💰 Send ${PRICE} USDT TRC20 to:\n`{YOUR_WALLET}`\n\n"
-            f"After payment send: `/tx YOUR_TXID`\n"
-            f"Bot will auto-verify in 20 seconds."
-        )
-
-async def tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("Usage: /tx TXID")
-        return
-    
-    txid = context.args[0]
-    await update.message.reply_text("⏳ Reviewing payment on TRON network...")
-
-    # AUTO CHECK PAYMENT
-    verified = await check_usdt_payment(txid)
-    
-    if verified:
-        users_db[user_id] = {"txid": txid, "status": "paid"}
-        await update.message.reply_text(
-            f"✅ Payment Confirmed: ${PRICE} USDT\n\n"
-            f"Generating AI Intelligence Report...\n"
-            f"TXID: `{txid}`"
-        )
-        await asyncio.sleep(2)
-        await update.message.reply_text(
-            "📄 INTELLIGENCE REPORT\n"
-            "Risk Level: HIGH\n"
-            "Database Matches: 0\n"
-            "Recommendation: AVOID\n"
-            "Full report sent to DM."
-        )
-        # Notify admin
-        await context.bot.send_message(ADMIN_ID, f"💰 New Payment!\nUser: {user_id}\nTXID: {txid}")
-    else:
-        await update.message.reply_text("❌ Payment not found or less than $5. Please send correct amount and try again.")
-
-async def check_usdt_payment(txid):
-    """Auto verify USDT TRC20 payment"""
+# === TRON USDT CHECK FUNCTION ===
+def get_last_usdt_tx(wallet_address):
     try:
-        url = f"{TRON_API}?transaction={txid}&limit=1"
-        r = requests.get(url, timeout=10).json()
-        if r.get("data"):
-            tx = r["data"][0]
-            amount = int(tx["amount"]) / 1000000 # USDT has 6 decimals
-            to_address = tx["toAddress"]
-            if to_address == YOUR_WALLET and amount >= PRICE:
-                return True
-    except:
-        pass
-    return False
+        url = f"{TRONGRID_URL}/v1/accounts/{wallet_address}/transactions/trc20"
+        params = {"contract_address": USDT_CONTRACT, "limit": 1, "only_to": "true"}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    total = len(users_db)
-    await update.message.reply_text(
-        f"👑 ADMIN PANEL\n\n"
-        f"Total Paid Users: {total}\n"
-        f"Wallet: `{YOUR_WALLET}`\n"
-        f"Use /ban user_id to ban"
+        if "data" in data and len(data["data"]) > 0:
+            tx = data["data"][0]
+            amount = int(tx["value"]) / 1_000_000
+            return {"amount": amount, "from": tx["from"], "time": tx["block_timestamp"]}
+        return None
+    except:
+        return None
+
+# === AUTO CHECK LOOP ===
+def auto_check_loop(context: CallbackContext):
+    while True:
+        try:
+            records = sheet.get_all_records()
+            for row in records:
+                wallet = row.get("Wallet")
+                user_id = row.get("UserID")
+                if wallet and user_id:
+                    tx = get_last_usdt_tx(wallet)
+                    if tx:
+                        msg = f"💰 *New USDT Received!*\n\nAmount: `{tx['amount']}` USDT\nFrom: `{tx['from']}`"
+                        context.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+            time.sleep(60) # Check every 60 seconds
+        except Exception as e:
+            print(f"Auto check error: {e}")
+            time.sleep(60)
+
+# === TELEGRAM COMMANDS - NICE DESIGN ===
+def start(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("🔍 Check Wallet", callback_data='check')],
+        [InlineKeyboardButton("📊 My Sheet", url=f"https://docs.google.com/spreadsheets/d/{sheet.id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text(
+        "👋 *Pro USDT Bot is LIVE*\n\n"
+        "Auto USDT Check: *ENABLED*\n"
+        "Google Sheets: *CONNECTED*\n\n"
+        "Commands:\n"
+        "`/add <wallet>` - Add wallet to track\n"
+        "`/check <wallet>` - Check last USDT\n"
+        "`/list` - List all tracked wallets",
+        parse_mode='Markdown',
+        reply_markup=reply_markup
     )
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("tx", tx))
-app.add_handler(CommandHandler("admin", admin))
-app.add_handler(CallbackQueryHandler(button))
+def add_wallet(update: Update, context: CallbackContext):
+    if len(context.args) == 0:
+        update.message.reply_text("Usage: `/add TRON_WALLET_ADDRESS`", parse_mode='Markdown')
+        return
+    wallet = context.args[0]
+    user_id = update.effective_user.id
+    sheet.append_row([user_id, wallet])
+    update.message.reply_text(f"✅ Wallet `{wallet}` added to tracking!", parse_mode='Markdown')
 
-print("Pro Bot Running. Auto USDT Check Enabled.")
-app.run_polling()
+def check(update: Update, context: CallbackContext):
+    if len(context.args) == 0:
+        update.message.reply_text("Usage: `/check TRON_WALLET_ADDRESS`", parse_mode='Markdown')
+        return
+    wallet = context.args[0]
+    tx = get_last_usdt_tx(wallet)
+    if tx:
+        update.message.reply_text(
+            f"🔍 *Last USDT Tx*\n\nAmount: `{tx['amount']}` USDT\nFrom: `{tx['from']}`",
+            parse_mode='Markdown'
+        )
+    else:
+        update.message.reply_text("No USDT transactions found for this wallet.")
+
+def list_wallets(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    records = sheet.get_all_records()
+    wallets = [r["Wallet"] for r in records if str(r["UserID"]) == str(user_id)]
+    if wallets:
+        msg = "📋 *Your Tracked Wallets:*\n\n" + "\n".join([f"`{w}`" for w in wallets])
+    else:
+        msg = "You have no wallets added yet. Use `/add <wallet>`"
+    update.message.reply_text(msg, parse_mode='Markdown')
+
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("add", add_wallet))
+    dp.add_handler(CommandHandler("check", check))
+    dp.add_handler(CommandHandler("list", list_wallets))
+
+    # Start auto check in background thread
+    thread = threading.Thread(target=auto_check_loop, args=(updater,), daemon=True)
+    thread.start()
+
+    print("Pro Bot Running. Auto USDT Check Enabled.")
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
